@@ -3,8 +3,6 @@ import logging
 import psycopg2
 from psycopg2 import sql
 
-
-
 from telegram import (
     Update,
     LabeledPrice,
@@ -23,12 +21,13 @@ from telegram.ext import (
 )
 from telegram.constants import ChatAction
 
+
 # ------------------ НАСТРОЙКИ БОТА И БАЗЫ ------------------
 
 # 1) Токен бота (получаем от BotFather)
-BOT_TOKEN = os.environ.get("BOT_TOKEN") or "ВАШ_BOT_TOKEN_ОТ_BOTFATHER"
+BOT_TOKEN = os.environ.get("BOT_TOKEN") or "ВАШ_BOT_TOKEN"
 
-# 2) Токен платёжного провайдера (получаем от BotFather, раздел Payments)
+# 2) Токен платёжного провайдера (получаем в BotFather -> Payments)
 PAYMENT_PROVIDER_TOKEN = os.environ.get("PAYMENT_PROVIDER_TOKEN") or "ВАШ_PAYMENT_PROVIDER_TOKEN"
 
 # 3) ID администратора (кто может банить/разбанивать)
@@ -45,26 +44,30 @@ BANNED_WORDS = {"badword1", "badword2"}
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
 # ------------------ ПОДКЛЮЧЕНИЕ К БАЗЕ ------------------
 
 conn = psycopg2.connect(DB_CONN_STR)
 conn.autocommit = True
 cursor = conn.cursor()
 
-# Создаём таблицы (если не существуют)
+# 1. Создаём таблицу users, если её нет (минимальный набор полей)
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS users (
     user_id BIGINT PRIMARY KEY,
     username TEXT,
     gender TEXT,
-    age INT,
-    region TEXT,
-    looking_for TEXT,
-    premium BOOLEAN DEFAULT FALSE,
-    banned BOOLEAN DEFAULT FALSE
+    age INT
 );
 """)
 
+# 2. Добавляем недостающие колонки (если они отсутствуют) — чтобы не было ошибок UndefinedColumn
+cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS region TEXT;")
+cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS looking_for TEXT;")
+cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS premium BOOLEAN DEFAULT FALSE;")
+cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS banned BOOLEAN DEFAULT FALSE;")
+
+# 3. Создаём (или проверяем) таблицу reports
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS reports (
     id SERIAL PRIMARY KEY,
@@ -94,7 +97,8 @@ def create_user(user_id: int, username: str):
     """
     Создаёт запись о пользователе, если её нет в БД.
     """
-    if get_user_profile(user_id) is None:
+    profile = get_user_profile(user_id)
+    if profile is None:
         cursor.execute("""
             INSERT INTO users (user_id, username)
             VALUES (%s, %s)
@@ -115,7 +119,7 @@ def is_banned(user_id: int) -> bool:
     """
     prof = get_user_profile(user_id)
     if prof:
-        return prof[7]  # banned
+        return prof[7]  # banned (True/False)
     return False
 
 def add_report(reporter_id: int, target_id: int, reason: str):
@@ -126,6 +130,7 @@ def add_report(reporter_id: int, target_id: int, reason: str):
         INSERT INTO reports (reporter_id, target_id, reason)
         VALUES (%s, %s, %s)
     """, (reporter_id, target_id, reason))
+
 
 # ------------------ СОСТОЯНИЯ ДЛЯ REGISTRATION ------------------
 
@@ -138,9 +143,10 @@ STATE_WAITING_PARTNER = "waiting_partner"
 
 # ------------------ ВНУТРЕННИЕ СЛОВАРИ ------------------
 
-user_state = {}       # user_id -> состояние (регистрация, в чате, в очереди и т.д.)
+user_state = {}       # user_id -> текущее состояние (регистрация, в чате, в очереди и т.д.)
 user_partner = {}     # user_id -> partner_id (с кем в чате)
 waiting_queue = []    # очередь на поиск собеседника
+
 
 # ------------------ ХЕНДЛЕРЫ РЕГИСТРАЦИИ ------------------
 
@@ -149,7 +155,6 @@ async def register_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = user.id
     username = user.username or "NoUsername"
 
-    # Создаём запись в БД, если нет
     create_user(user_id, username)
 
     if is_banned(user_id):
@@ -170,7 +175,6 @@ async def reg_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     gender = "М" if text == "м" else "Ж"
     update_user_field(user_id, "gender", gender)
-
     await update.message.reply_text("Укажите ваш возраст (число).")
     user_state[user_id] = REG_AGE
     return REG_AGE
@@ -222,6 +226,7 @@ async def reg_looking_for(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     user_state[user_id] = None
     return ConversationHandler.END
+
 
 # ------------------ ОБЩИЕ КОМАНДЫ ------------------
 
@@ -314,7 +319,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Вы заблокированы.")
         return
 
-    # Проверяем анкету
+    # Проверяем анкету (gender, age, region, looking_for)
     prof = get_user_profile(user_id)
     if not prof or not prof[2] or not prof[3] or not prof[4] or not prof[5]:
         await update.message.reply_text("Сначала заполните анкету: /register.")
@@ -345,6 +350,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_state[user_id] = STATE_WAITING_PARTNER
         await update.message.reply_text("В очереди пока нет подходящего собеседника. Ждём...")
 
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if is_banned(user_id):
@@ -374,6 +380,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Вы не в чате. Используйте /search, чтобы найти собеседника.")
 
+
 # ------------------ РЕПОРТЫ ------------------
 
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -396,13 +403,14 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text=f"Поступила жалоба! От {user_id} на {partner_id}."
     )
 
+
 # ------------------ ПРЕМИУМ ------------------
 
 async def premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Премиум-подписка даёт:\n"
         "- Метку [Премиум] в чате.\n"
-        "- (Дополнительно можете добавить больше функций)\n\n"
+        "- (Можно расширить функционал)\n\n"
         "Нажмите /buy, чтобы оформить подписку."
     )
 
@@ -428,6 +436,7 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
     user_id = update.effective_user.id
     update_user_field(user_id, "premium", True)
     await update.message.reply_text("Оплата прошла успешно! Премиум-статус активирован.")
+
 
 # ------------------ АДМИН-ФУНКЦИИ ------------------
 
@@ -458,6 +467,7 @@ async def admin_unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target = int(args[1])
     update_user_field(target, "banned", False)
     await update.message.reply_text(f"Пользователь {target} разбанен.")
+
 
 # ------------------ MAIN (ЗАПУСК) ------------------
 
