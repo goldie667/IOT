@@ -3,6 +3,8 @@ import logging
 import psycopg2
 from psycopg2 import sql
 
+
+
 from telegram import (
     Update,
     LabeledPrice,
